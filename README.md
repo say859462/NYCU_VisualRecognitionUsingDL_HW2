@@ -173,6 +173,8 @@ python visualize.py --config .\config.json --split val --model_path .\Model_Weig
 - Hugging Face checkpoint: `PekingU/rtdetr_v2_r50vd`
 - DETR: End-to-End Object Detection with Transformers
 - RT-DETRv2: Improved Baseline for Real-Time Detection Transformer
+- Deformable detr: Deformable transformers for end-to-end object detection
+- Relation detr: Exploring explicit position relation prior for object detection
 ## Snapshot
 <img width="1273" height="76" alt="image" src="https://github.com/user-attachments/assets/cbe03c94-ecb9-4e97-9035-74cc40f2e7d7" />
 
