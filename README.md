@@ -75,12 +75,6 @@ In short, **auxiliary fusion was the most reliable positive direction**, while h
 - Light affine augmentation
 - Fixed rectangular resize
 
-### Best Additional Idea
-
-The most effective idea was to add an **auxiliary digit classifier** during training and use it during inference to refine the detector logits. This produced:
-
-- higher GT-side correctness in `EXP60`
-- a more robust version with fewer side effects in `EXP64`
 
 ---
 
