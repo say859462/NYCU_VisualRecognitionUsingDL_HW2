@@ -18,7 +18,7 @@ The homework requires:
 - **no external data**
 - COCO-style final prediction file `pred.json`
 
-After a long experiment sequence, the final direction converged to **RT-DETRv2 with a fixed rectangular input shape (`320x640`) plus an auxiliary digit-classification branch**. The strongest hidden-test score in our experiments was **0.41 mAP**, achieved by:
+After a long experiment sequence, the final direction converged to **RT-DETRv2 with a fixed rectangular input shape (`320x640`) plus an auxiliary digit-classification branch**. The strongest public-test score in our experiments was **0.41 mAP**, achieved by:
 
 - `EXP60`: aggressive inference-time auxiliary fusion
 - `EXP64`: a more robust variant of `EXP60` with family-specific attenuation on `{1,4,7}`
@@ -35,7 +35,7 @@ The most important conclusions from this homework are:
   - `AP 0.4790 / AP50 0.9361 / AP75 0.421`
 - `EXP64 attn015` preserved almost all of that gain while making predictions cleaner:
   - `AP 0.4788 / AP50 0.9360 / AP75 0.422`
-- On the hidden test set, both `EXP60` and `EXP64` reached **0.41 mAP**.
+- On the public test set, both `EXP60` and `EXP64` reached **0.41 mAP**.
 - `EXP65` (targeted confusion loss) improved validation but dropped on test:
   - validation `0.4775`, test `0.40`
 - `EXP66` (queries `300 -> 1000`) did not improve test:
@@ -153,7 +153,7 @@ python visualize.py --config .\config.json --split val --model_path .\Model_Weig
 
 ### Main RT-DETRv2 Experiments
 
-| Experiment | Main Idea | Val AP | AP50 | AP75 | Hidden-Test mAP | Interpretation |
+| Experiment | Main Idea | Val AP | AP50 | AP75 | public-Test mAP | Interpretation |
 |---|---|---:|---:|---:|---:|---|
 | `EXP54` | fixed `320x640` RT-DETRv2 baseline | `0.4725` | `0.9275` | `0.414` | - | strong baseline |
 | `EXP56` | train-only auxiliary digit head | `0.4729` | `0.9298` | `0.411` | - | cleaner predictions, no direct test evidence alone |
