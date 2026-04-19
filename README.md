@@ -6,7 +6,6 @@
 
 #### ***Student ID:*** 314551113
 
-#### ***GitHub:*** https://github.com/say859462/NYCU_VisualRecognitionUsingDL_HW2
 
 ---
 
