@@ -52,7 +52,7 @@ In short, **auxiliary fusion was the most reliable positive direction**, while h
 - Backbone: `ResNet-50`
 - Detector: `RT-DETRv2`
 - Model source: `PekingU/rtdetr_v2_r50vd`
-- Load strategy: `pretrained_reset_transformer`
+- Load strategy: Preserve ResNet 50 pretrained weight only , initialize all other components
 - Input size: fixed `320x640`
 - Queries: `300`
 - Post-process: official Hugging Face RT-DETRv2 pipeline
