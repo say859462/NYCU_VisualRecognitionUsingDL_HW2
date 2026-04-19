@@ -243,54 +243,6 @@ class MLP(nn.Module):
         return x
 
 
-class GroupedPredictionHead(nn.Module):
-    """ResNeXt-style grouped bottleneck head for query classification."""
-
-    def __init__(self, input_dim: int, output_dim: int, num_groups: int = 4, bottleneck_ratio: float = 0.5):
-        super().__init__()
-        self.num_groups = max(1, int(num_groups))
-        if input_dim % self.num_groups != 0:
-            raise ValueError(
-                f"input_dim={input_dim} must be divisible by num_groups={self.num_groups}")
-
-        self.input_dim = input_dim
-        self.group_dim = input_dim // self.num_groups
-        self.bottleneck_dim = max(16, int(self.group_dim * bottleneck_ratio))
-        self.norm = nn.LayerNorm(input_dim)
-        self.group_mlps = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(self.group_dim, self.bottleneck_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(self.bottleneck_dim, self.group_dim),
-                    nn.ReLU(inplace=True),
-                )
-                for _ in range(self.num_groups)
-            ]
-        )
-        self.out_proj = nn.Linear(input_dim, output_dim)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.constant_(self.norm.bias, 0.0)
-        nn.init.constant_(self.norm.weight, 1.0)
-        for branch in self.group_mlps:
-            for module in branch:
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight)
-                    nn.init.constant_(module.bias, 0.0)
-        nn.init.xavier_uniform_(self.out_proj.weight)
-        nn.init.constant_(self.out_proj.bias, 0.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.norm(x)
-        grouped_inputs = residual.chunk(self.num_groups, dim=-1)
-        grouped_outputs = [branch(chunk) for branch, chunk in zip(
-            self.group_mlps, grouped_inputs)]
-        fused = torch.cat(grouped_outputs, dim=-1) + residual
-        return self.out_proj(fused)
-
-
 class PositionEmbeddingSine(nn.Module):
     def __init__(self, num_pos_feats: int = 128, temperature: int = 10000, normalize: bool = True):
         super().__init__()
@@ -1069,130 +1021,6 @@ class RelationTransformerDecoder(nn.Module):
         return outputs_classes, outputs_objectness, outputs_coords
 
 
-class QueryRelationLayer(nn.Module):
-    """Lightweight relation-aware refinement over two-stage top-k queries."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        dropout: float = 0.1,
-        ffn_dim: int = 1024,
-        geometry_hidden_dim: int = 128,
-    ):
-        super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.geometry_mlp = nn.Sequential(
-            nn.Linear(5, geometry_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(geometry_hidden_dim, num_heads),
-        )
-        self.attn_dropout = nn.Dropout(dropout)
-        self.out_dropout = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, ffn_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        for module in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
-            nn.init.xavier_uniform_(module.weight)
-            nn.init.constant_(module.bias, 0.0)
-        for module in self.geometry_mlp:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.constant_(module.bias, 0.0)
-        for module in self.ffn:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.constant_(module.bias, 0.0)
-
-    @staticmethod
-    def _pairwise_geometry(reference_boxes: torch.Tensor) -> torch.Tensor:
-        eps = 1e-6
-        cx, cy, w, h = reference_boxes.unbind(dim=-1)
-        dx = (cx.unsqueeze(2) - cx.unsqueeze(1)) / (w.unsqueeze(2) + eps)
-        dy = (cy.unsqueeze(2) - cy.unsqueeze(1)) / (h.unsqueeze(2) + eps)
-        dw = torch.log((w.unsqueeze(2) + eps) / (w.unsqueeze(1) + eps))
-        dh = torch.log((h.unsqueeze(2) + eps) / (h.unsqueeze(1) + eps))
-        boxes_xyxy = box_cxcywh_to_xyxy(reference_boxes)
-        iou_maps = []
-        for batch_boxes in boxes_xyxy:
-            iou_maps.append(box_iou(batch_boxes, batch_boxes))
-        iou = torch.stack(iou_maps, dim=0)
-        return torch.stack([dx, dy, dw, dh, iou], dim=-1)
-
-    def forward(self, query: torch.Tensor, reference_boxes: torch.Tensor) -> torch.Tensor:
-        residual = query
-        query_norm = self.norm1(query)
-        batch_size, num_queries, _ = query_norm.shape
-        q = self.q_proj(query_norm).view(batch_size, num_queries,
-                                         self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(query_norm).view(batch_size, num_queries,
-                                         self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(query_norm).view(batch_size, num_queries,
-                                         self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_logits = torch.matmul(
-            q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        geometry_bias = self.geometry_mlp(
-            self._pairwise_geometry(reference_boxes)).permute(0, 3, 1, 2)
-        attn = F.softmax(attn_logits + geometry_bias, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        relation_context = torch.matmul(attn, v).transpose(
-            1, 2).contiguous().view(batch_size, num_queries, self.hidden_dim)
-        query = residual + self.out_dropout(self.out_proj(relation_context))
-        query = query + self.ffn(self.norm2(query))
-        return query
-
-
-class QueryRelationEncoder(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        num_layers: int,
-        dropout: float = 0.1,
-        ffn_dim: int = 1024,
-        geometry_hidden_dim: int = 128,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                QueryRelationLayer(
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    ffn_dim=ffn_dim,
-                    geometry_hidden_dim=geometry_hidden_dim,
-                )
-                for _ in range(max(1, int(num_layers)))
-            ]
-        )
-
-    def forward(self, query: torch.Tensor, reference_boxes: torch.Tensor) -> torch.Tensor:
-        output = query
-        for layer in self.layers:
-            output = layer(output, reference_boxes)
-        return output
-
-
 class DETRModel(nn.Module):
     """Two-stage multi-scale Deformable DETR-R50."""
 
@@ -1215,8 +1043,6 @@ class DETRModel(nn.Module):
         two_stage: bool = True,
         use_official_cuda_msda: bool = True,
         use_fpn_features: bool = False,
-        use_exp32: bool = False,
-        exp32_num_groups: int = 4,
         use_backbone_dc5: bool = False,
         use_relation_detr_main: bool = False,
         align_relation_official_head_loss: bool = False,
@@ -1227,11 +1053,6 @@ class DETRModel(nn.Module):
         relation_denoising_nums: int = 100,
         relation_label_noise_prob: float = 0.5,
         relation_box_noise_scale: float = 1.0,
-        use_query_relation: bool = False,
-        query_relation_layers: int = 1,
-        query_relation_num_heads: int = 8,
-        query_relation_ffn_dim: int = 1024,
-        query_relation_geometry_hidden_dim: int = 128,
         backbone_pretrain_source: str = "imagenet",
         backbone_pretrain_checkpoint_path: str | None = None,
         backbone_pretrain_url: str | None = None,
@@ -1264,11 +1085,6 @@ class DETRModel(nn.Module):
         self.relation_denoising_nums = max(1, int(relation_denoising_nums))
         self.relation_label_noise_prob = float(relation_label_noise_prob)
         self.relation_box_noise_scale = float(relation_box_noise_scale)
-        self.use_exp32 = bool(
-            use_exp32) and not self.align_relation_official_head_loss
-        self.exp32_num_groups = max(1, int(exp32_num_groups))
-        self.use_query_relation = bool(use_query_relation) and bool(
-            two_stage) and not self.use_relation_detr_main
         self.use_aux_digit_classifier = bool(use_aux_digit_classifier)
         self.aux_digit_pool_size = max(1, int(aux_digit_pool_size))
         self.aux_digit_classifier_fusion_weight = float(
@@ -1368,13 +1184,8 @@ class DETRModel(nn.Module):
         if self.two_stage:
             self.enc_output = nn.Linear(hidden_dim, hidden_dim)
             self.enc_output_norm = nn.LayerNorm(hidden_dim)
-            if self.use_exp32:
-                self.enc_class_embed = GroupedPredictionHead(
-                    hidden_dim, num_classes, num_groups=self.exp32_num_groups)
-                self.enc_objectness_embed = nn.Linear(hidden_dim, 1)
-            else:
-                self.enc_class_embed = nn.Linear(hidden_dim, num_classes)
-                self.enc_objectness_embed = None
+            self.enc_class_embed = nn.Linear(hidden_dim, num_classes)
+            self.enc_objectness_embed = None
             self.enc_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
             self.pos_trans = nn.Linear(hidden_dim * 2, hidden_dim * 2)
             self.pos_trans_norm = nn.LayerNorm(hidden_dim * 2)
@@ -1383,19 +1194,6 @@ class DETRModel(nn.Module):
             self.hybrid_tgt_embed = (
                 nn.Embedding(self.relation_hybrid_num_proposals, hidden_dim)
                 if self.use_relation_hybrid
-                else None
-            )
-            self.query_relation_encoder = (
-                QueryRelationEncoder(
-                    hidden_dim=hidden_dim,
-                    num_heads=int(query_relation_num_heads),
-                    num_layers=int(query_relation_layers),
-                    dropout=dropout,
-                    ffn_dim=int(query_relation_ffn_dim),
-                    geometry_hidden_dim=int(
-                        query_relation_geometry_hidden_dim),
-                )
-                if self.use_query_relation
                 else None
             )
             self.hybrid_enc_class_embed = nn.Linear(
@@ -1419,17 +1217,10 @@ class DETRModel(nn.Module):
             self.query_pos_embed = nn.Embedding(num_queries, hidden_dim)
             self.reference_points = nn.Linear(hidden_dim, 2)
 
-        if self.use_exp32:
-            self.class_embed = nn.ModuleList(
-                [GroupedPredictionHead(
-                    hidden_dim, num_classes, num_groups=self.exp32_num_groups) for _ in range(num_decoder_layers)]
-            )
-            self.objectness_embed = nn.ModuleList(
-                [nn.Linear(hidden_dim, 1) for _ in range(num_decoder_layers)])
-        else:
-            self.class_embed = nn.ModuleList(
-                [nn.Linear(hidden_dim, num_classes) for _ in range(num_decoder_layers)])
-            self.objectness_embed = None
+        self.class_embed = nn.ModuleList(
+            [nn.Linear(hidden_dim, num_classes) for _ in range(num_decoder_layers)]
+        )
+        self.objectness_embed = None
         self.bbox_embed = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_decoder_layers)])
         self.hybrid_class_embed = (
@@ -1467,15 +1258,12 @@ class DETRModel(nn.Module):
         if self.two_stage:
             nn.init.xavier_uniform_(self.enc_output.weight)
             nn.init.constant_(self.enc_output.bias, 0.0)
-            if isinstance(self.enc_class_embed, nn.Linear):
-                if self.use_relation_detr_main:
-                    prior_prob = 0.01
-                    bias_value = -math.log((1 - prior_prob) / prior_prob)
-                    nn.init.constant_(self.enc_class_embed.bias, bias_value)
-                else:
-                    nn.init.constant_(self.enc_class_embed.bias, 0.0)
+            if self.use_relation_detr_main:
+                prior_prob = 0.01
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(self.enc_class_embed.bias, bias_value)
             else:
-                self.enc_class_embed.reset_parameters()
+                nn.init.constant_(self.enc_class_embed.bias, 0.0)
             if self.enc_objectness_embed is not None:
                 nn.init.xavier_uniform_(self.enc_objectness_embed.weight)
                 nn.init.constant_(self.enc_objectness_embed.bias, 0.0)
@@ -1512,15 +1300,12 @@ class DETRModel(nn.Module):
                 nn.init.xavier_uniform_(module[0].weight)
                 nn.init.constant_(module[0].bias, 0.0)
         for class_embed in self.class_embed:
-            if isinstance(class_embed, nn.Linear):
-                if self.use_relation_detr_main:
-                    prior_prob = 0.01
-                    bias_value = -math.log((1 - prior_prob) / prior_prob)
-                    nn.init.constant_(class_embed.bias, bias_value)
-                else:
-                    nn.init.constant_(class_embed.bias, 0.0)
+            if self.use_relation_detr_main:
+                prior_prob = 0.01
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(class_embed.bias, bias_value)
             else:
-                class_embed.reset_parameters()
+                nn.init.constant_(class_embed.bias, 0.0)
         if self.objectness_embed is not None:
             for objectness_embed in self.objectness_embed:
                 nn.init.xavier_uniform_(objectness_embed.weight)
@@ -1578,8 +1363,6 @@ class DETRModel(nn.Module):
                        self.enc_bbox_embed, self.pos_trans, self.pos_trans_norm]
             if self.enc_objectness_embed is not None:
                 modules.append(self.enc_objectness_embed)
-            if self.query_relation_encoder is not None:
-                modules.append(self.query_relation_encoder)
             if self.relation_tgt_embed is not None:
                 modules.append(self.relation_tgt_embed)
             if self.hybrid_tgt_embed is not None:
@@ -1959,9 +1742,6 @@ class DETRModel(nn.Module):
                 query_pos, tgt = torch.split(
                     query_embed, self.hidden_dim, dim=-1)
                 tgt = tgt + topk_memory
-                if self.query_relation_encoder is not None:
-                    tgt = self.query_relation_encoder(
-                        tgt, topk_coords_unact.sigmoid())
         else:
             query_pos = self.query_pos_embed.weight.unsqueeze(
                 0).repeat(batch_size, 1, 1)
@@ -2226,7 +2006,7 @@ def _lazy_import_hf_rtdetr_v2():
 
 
 def _is_hf_rtdetr_v2_backend_name(model_backend: str | None) -> bool:
-    return str(model_backend or "").lower() in {"hf_rtdetr_v2", "hf_rtdetr_v2_aux", "hf_rtdetr_v2_qs"}
+    return str(model_backend or "").lower() in {"hf_rtdetr_v2", "hf_rtdetr_v2_aux"}
 
 
 class HFRTDetrV2Adapter(nn.Module):
@@ -2649,273 +2429,6 @@ class HFRTDetrV2AuxAdapter(HFRTDetrV2Adapter):
             output["pred_aux_digit_family_mask"] = aux_digit_family_mask
         if aux_digit_effective_weight_mask is not None:
             output["pred_aux_digit_effective_weight_mask"] = aux_digit_effective_weight_mask
-        return output
-
-
-class HFRTDetrV2QuerySelectionAdapter(HFRTDetrV2Adapter):
-    """HF RT-DETRv2 with quality-aware encoder proposal selection."""
-
-    def __init__(
-        self,
-        num_classes: int = 10,
-        num_queries: int = 300,
-        hf_model_name_or_path: str = "PekingU/rtdetr_v2_r50vd",
-        hf_load_strategy: str = "pretrained_reset_transformer",
-        hf_ignore_mismatched_sizes: bool = True,
-        hf_eos_coefficient: float | None = None,
-        hf_backbone_name: str = "resnet50",
-        hf_use_timm_backbone: bool = True,
-        hf_use_pretrained_backbone: bool = True,
-        query_quality_hidden_dim: int = 256,
-        query_selection_alpha: float = 1.0,
-        query_selection_beta: float = 1.0,
-    ):
-        super().__init__(
-            num_classes=num_classes,
-            num_queries=num_queries,
-            hf_model_name_or_path=hf_model_name_or_path,
-            hf_load_strategy=hf_load_strategy,
-            hf_ignore_mismatched_sizes=hf_ignore_mismatched_sizes,
-            hf_eos_coefficient=hf_eos_coefficient,
-            hf_backbone_name=hf_backbone_name,
-            hf_use_timm_backbone=hf_use_timm_backbone,
-            hf_use_pretrained_backbone=hf_use_pretrained_backbone,
-        )
-        hidden_dim = int(getattr(self.model.config, "d_model", 256))
-        quality_hidden_dim = max(32, int(query_quality_hidden_dim))
-        self.query_quality_norm = nn.LayerNorm(hidden_dim)
-        self.query_quality_head = nn.Sequential(
-            nn.Linear(hidden_dim, quality_hidden_dim),
-            nn.GELU(),
-            nn.Linear(quality_hidden_dim, 1),
-        )
-        self.query_selection_alpha = max(0.0, float(query_selection_alpha))
-        self.query_selection_beta = max(0.0, float(query_selection_beta))
-        self._reset_query_quality_parameters()
-
-    def _reset_query_quality_parameters(self) -> None:
-        nn.init.constant_(self.query_quality_norm.bias, 0.0)
-        nn.init.constant_(self.query_quality_norm.weight, 1.0)
-        for module in self.query_quality_head.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.constant_(module.bias, 0.0)
-
-    @staticmethod
-    def _lazy_import_denoising_helper():
-        try:
-            from transformers.models.rt_detr_v2.modeling_rt_detr_v2 import get_contrastive_denoising_training_group
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "HF RT-DETRv2 quality-selection backend requires the RT-DETRv2 modeling helpers from transformers."
-            ) from exc
-        return get_contrastive_denoising_training_group
-
-    def _build_detection_outputs_with_quality_selection(
-        self,
-        images: torch.Tensor,
-        pixel_mask: torch.Tensor | None,
-        hf_labels: list[dict] | None,
-    ) -> dict:
-        rtdetr_model = self.model.model
-        config = self.model.config
-
-        if pixel_mask is None:
-            batch_size, _, height, width = images.shape
-            pixel_mask = torch.ones(
-                (batch_size, height, width),
-                device=images.device,
-                dtype=torch.long,
-            )
-
-        features = rtdetr_model.backbone(images, pixel_mask)
-        proj_feats = [
-            rtdetr_model.encoder_input_proj[level](source)
-            for level, (source, _mask) in enumerate(features)
-        ]
-        encoder_outputs = rtdetr_model.encoder(proj_feats)
-
-        sources = []
-        for level, source in enumerate(encoder_outputs.last_hidden_state):
-            sources.append(rtdetr_model.decoder_input_proj[level](source))
-
-        if config.num_feature_levels > len(sources):
-            source_count = len(sources)
-            sources.append(rtdetr_model.decoder_input_proj[source_count](encoder_outputs.last_hidden_state)[-1])
-            for level in range(source_count + 1, config.num_feature_levels):
-                sources.append(rtdetr_model.decoder_input_proj[level](encoder_outputs.last_hidden_state[-1]))
-
-        source_flatten = []
-        spatial_shapes_list = []
-        spatial_shapes = torch.empty((len(sources), 2), device=images.device, dtype=torch.long)
-        for level, source in enumerate(sources):
-            height, width = source.shape[-2:]
-            spatial_shapes[level, 0] = height
-            spatial_shapes[level, 1] = width
-            spatial_shapes_list.append((height, width))
-            source_flatten.append(source.flatten(2).transpose(1, 2))
-        source_flatten = torch.cat(source_flatten, dim=1)
-        level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-
-        if self.training and config.num_denoising > 0 and hf_labels is not None:
-            get_contrastive_denoising_training_group = self._lazy_import_denoising_helper()
-            (
-                denoising_class,
-                denoising_bbox_unact,
-                attention_mask,
-                denoising_meta_values,
-            ) = get_contrastive_denoising_training_group(
-                targets=hf_labels,
-                num_classes=config.num_labels,
-                num_queries=config.num_queries,
-                class_embed=rtdetr_model.denoising_class_embed,
-                num_denoising_queries=config.num_denoising,
-                label_noise_ratio=config.label_noise_ratio,
-                box_noise_scale=config.box_noise_scale,
-            )
-        else:
-            denoising_class = None
-            denoising_bbox_unact = None
-            attention_mask = None
-            denoising_meta_values = None
-
-        dtype = source_flatten.dtype
-        if self.training or config.anchor_image_size is None:
-            anchors, valid_mask = rtdetr_model.generate_anchors(
-                tuple(spatial_shapes_list),
-                device=images.device,
-                dtype=dtype,
-            )
-        else:
-            anchors, valid_mask = rtdetr_model.anchors, rtdetr_model.valid_mask
-            anchors = anchors.to(images.device, dtype)
-            valid_mask = valid_mask.to(images.device, dtype)
-
-        memory = valid_mask.to(dtype) * source_flatten
-        output_memory = rtdetr_model.enc_output(memory)
-
-        enc_outputs_class = rtdetr_model.enc_score_head(output_memory)
-        enc_outputs_coord_logits = rtdetr_model.enc_bbox_head(output_memory) + anchors
-
-        normalized_output_memory = self.query_quality_norm(output_memory)
-        enc_outputs_quality_logits = self.query_quality_head(normalized_output_memory)
-        class_confidence = enc_outputs_class.float().sigmoid().amax(dim=-1)
-        quality_confidence = enc_outputs_quality_logits.float().sigmoid().squeeze(-1)
-        selection_score = class_confidence.pow(self.query_selection_alpha) * quality_confidence.pow(self.query_selection_beta)
-        valid_anchor_mask = valid_mask.squeeze(-1).to(dtype=torch.bool)
-        selection_score = selection_score.masked_fill(~valid_anchor_mask, -1.0)
-
-        _, topk_ind = torch.topk(selection_score, config.num_queries, dim=1)
-        gather_index_4 = topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_logits.shape[-1])
-        reference_points_unact = enc_outputs_coord_logits.gather(dim=1, index=gather_index_4)
-        enc_topk_bboxes = reference_points_unact.sigmoid()
-
-        if denoising_bbox_unact is not None:
-            reference_points_unact = torch.cat([denoising_bbox_unact, reference_points_unact], dim=1)
-
-        gather_index_logits = topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_class.shape[-1])
-        enc_topk_logits = enc_outputs_class.gather(dim=1, index=gather_index_logits)
-        enc_topk_quality_logits = enc_outputs_quality_logits.gather(
-            dim=1,
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_quality_logits.shape[-1]),
-        )
-
-        if config.learn_initial_query:
-            target = rtdetr_model.weight_embedding.tile([images.shape[0], 1, 1])
-        else:
-            target = output_memory.gather(
-                dim=1,
-                index=topk_ind.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1]),
-            ).detach()
-
-        if denoising_class is not None:
-            target = torch.cat([denoising_class, target], dim=1)
-
-        init_reference_points = reference_points_unact.detach()
-        decoder_outputs = rtdetr_model.decoder(
-            inputs_embeds=target,
-            encoder_hidden_states=source_flatten,
-            encoder_attention_mask=attention_mask,
-            reference_points=init_reference_points,
-            spatial_shapes=spatial_shapes,
-            spatial_shapes_list=spatial_shapes_list,
-            level_start_index=level_start_index,
-        )
-
-        outputs_class = decoder_outputs.intermediate_logits
-        outputs_coord = decoder_outputs.intermediate_reference_points
-        predicted_corners = decoder_outputs.intermediate_predicted_corners
-        initial_reference_points = decoder_outputs.initial_reference_points
-        logits = outputs_class[:, -1]
-        pred_boxes = outputs_coord[:, -1]
-
-        official_loss = None
-        official_loss_dict = None
-        official_auxiliary_outputs = None
-        if hf_labels is not None:
-            official_loss, official_loss_dict, official_auxiliary_outputs = self.model.loss_function(
-                logits,
-                hf_labels,
-                self.model.device,
-                pred_boxes,
-                config,
-                outputs_class,
-                outputs_coord,
-                enc_topk_logits=enc_topk_logits,
-                enc_topk_bboxes=enc_topk_bboxes,
-                denoising_meta_values=denoising_meta_values if self.training else None,
-                predicted_corners=predicted_corners,
-                initial_reference_points=initial_reference_points,
-            )
-
-        return {
-            "pred_logits": logits,
-            "pred_boxes": pred_boxes,
-            "official_loss": official_loss,
-            "official_loss_dict": official_loss_dict,
-            "official_auxiliary_outputs": official_auxiliary_outputs,
-            "decoder_last_hidden_state": decoder_outputs.last_hidden_state,
-            "decoder_intermediate_hidden_states": decoder_outputs.intermediate_hidden_states,
-            "enc_outputs_class": enc_outputs_class,
-            "enc_outputs_coord_logits": enc_outputs_coord_logits,
-            "enc_outputs_quality_logits": enc_outputs_quality_logits,
-            "enc_topk_logits": enc_topk_logits,
-            "enc_topk_bboxes": enc_topk_bboxes,
-            "enc_topk_quality_logits": enc_topk_quality_logits,
-            "enc_query_selection_scores": selection_score,
-            "enc_valid_mask": valid_anchor_mask,
-        }
-
-    def forward(
-        self,
-        images: torch.Tensor,
-        masks: torch.Tensor,
-        targets: list[dict] | None = None,
-    ) -> dict:
-        pixel_mask = None if masks is None else (~masks).to(dtype=torch.long)
-        hf_labels = self._build_hf_labels(targets) if targets is not None else None
-        outputs = self._build_detection_outputs_with_quality_selection(
-            images=images,
-            pixel_mask=pixel_mask,
-            hf_labels=hf_labels,
-        )
-
-        output = {
-            "pred_logits": outputs["pred_logits"],
-            "pred_boxes": outputs["pred_boxes"],
-            "enc_outputs_class": outputs["enc_outputs_class"],
-            "enc_outputs_coord_logits": outputs["enc_outputs_coord_logits"],
-            "enc_outputs_quality_logits": outputs["enc_outputs_quality_logits"],
-            "enc_topk_logits": outputs["enc_topk_logits"],
-            "enc_topk_bboxes": outputs["enc_topk_bboxes"],
-            "enc_topk_quality_logits": outputs["enc_topk_quality_logits"],
-            "enc_query_selection_scores": outputs["enc_query_selection_scores"],
-            "enc_valid_mask": outputs["enc_valid_mask"],
-        }
-        if outputs["official_loss"] is not None:
-            output["official_loss"] = outputs["official_loss"]
-        if outputs["official_loss_dict"] is not None:
-            output["official_loss_dict"] = outputs["official_loss_dict"]
         return output
 
 
@@ -3911,27 +3424,11 @@ def build_model_from_config(
             aux_digit_family_fusion_weights=config.get("aux_digit_family_fusion_weights"),
             aux_digit_family_attenuation_weights=config.get("aux_digit_family_attenuation_weights"),
         )
-    if model_backend == "hf_rtdetr_v2_qs":
-        return HFRTDetrV2QuerySelectionAdapter(
-            num_classes=int(config["num_classes"]),
-            num_queries=int(config.get("num_queries", 300)),
-            hf_model_name_or_path=str(config.get("hf_model_name_or_path", "PekingU/rtdetr_v2_r50vd")),
-            hf_load_strategy=str(config.get("hf_load_strategy", "pretrained_reset_transformer")),
-            hf_ignore_mismatched_sizes=bool(config.get("hf_ignore_mismatched_sizes", True)),
-            hf_eos_coefficient=config.get("hf_eos_coefficient"),
-            hf_backbone_name=str(config.get("hf_backbone_name", "resnet50")),
-            hf_use_timm_backbone=bool(config.get("hf_use_timm_backbone", True)),
-            hf_use_pretrained_backbone=bool(config.get("hf_use_pretrained_backbone", True)),
-            query_quality_hidden_dim=int(config.get("query_quality_hidden_dim", 256)),
-            query_selection_alpha=float(config.get("query_selection_alpha", 1.0)),
-            query_selection_beta=float(config.get("query_selection_beta", 1.0)),
-        )
-
     if model_backend not in {"custom_relation_detr", "relation_detr_custom"}:
         raise ValueError(
             f"Unsupported model_backend '{model_backend}'. "
             "Supported backends are "
-            "{'custom_relation_detr', 'relation_detr_custom', 'hf_rtdetr_v2', 'hf_rtdetr_v2_aux', 'hf_rtdetr_v2_qs'}."
+            "{'custom_relation_detr', 'relation_detr_custom', 'hf_rtdetr_v2', 'hf_rtdetr_v2_aux'}."
         )
 
     pretrained_backbone = bool(config.get("pretrained_backbone", True))
@@ -3956,8 +3453,6 @@ def build_model_from_config(
         two_stage=bool(config.get("two_stage", True)),
         use_official_cuda_msda=bool(config.get("use_official_cuda_msda", True)),
         use_fpn_features=bool(config.get("use_fpn_features", False)),
-        use_exp32=bool(config.get("use_exp32", False)),
-        exp32_num_groups=int(config.get("exp32_num_groups", 4)),
         use_backbone_dc5=bool(config.get("use_backbone_dc5", False)),
         use_relation_detr_main=bool(config.get("use_relation_detr_main", False)),
         align_relation_official_head_loss=bool(config.get("align_relation_official_head_loss", False)),
@@ -3968,11 +3463,6 @@ def build_model_from_config(
         relation_denoising_nums=int(config.get("relation_denoising_nums", 100)),
         relation_label_noise_prob=float(config.get("relation_label_noise_prob", 0.5)),
         relation_box_noise_scale=float(config.get("relation_box_noise_scale", 1.0)),
-        use_query_relation=bool(config.get("use_query_relation", False)),
-        query_relation_layers=int(config.get("query_relation_layers", 1)),
-        query_relation_num_heads=int(config.get("query_relation_num_heads", config.get("nheads", 8))),
-        query_relation_ffn_dim=int(config.get("query_relation_ffn_dim", 1024)),
-        query_relation_geometry_hidden_dim=int(config.get("query_relation_geometry_hidden_dim", 128)),
         use_aux_digit_classifier=bool(config.get("use_aux_digit_classifier", False)),
         aux_digit_pool_size=int(config.get("aux_digit_pool_size", 5)),
         aux_digit_hidden_dim=int(config.get("aux_digit_hidden_dim", 256)),

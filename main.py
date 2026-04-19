@@ -36,7 +36,7 @@ from utils import (
 )
 from val import validate_one_epoch
 
-HF_RTDETR_BACKENDS = {"hf_rtdetr_v2", "hf_rtdetr_v2_aux", "hf_rtdetr_v2_qs"}
+HF_RTDETR_BACKENDS = {"hf_rtdetr_v2", "hf_rtdetr_v2_aux"}
 
 
 def set_global_seed(seed: int) -> None:
@@ -62,6 +62,38 @@ def ensure_parent_dir(path: str) -> None:
     parent_dir = os.path.dirname(path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
+
+
+def parse_epoch_checkpoint_targets(config: dict) -> set[int]:
+    """Return the set of epochs that should export standalone model weights."""
+    raw_epochs = config.get("save_epoch_checkpoints", [])
+    if not isinstance(raw_epochs, list):
+        return set()
+    return {
+        int(epoch)
+        for epoch in raw_epochs
+        if isinstance(epoch, (int, float, str)) and str(epoch).strip()
+    }
+
+
+def save_epoch_checkpoint_if_requested(
+    epoch: int,
+    model: torch.nn.Module,
+    config: dict,
+    epoch_checkpoint_targets: set[int],
+) -> None:
+    """Save standalone epoch weights for submission-oriented checkpoint sweeps."""
+    if epoch not in epoch_checkpoint_targets:
+        return
+
+    path_template = config.get("epoch_checkpoint_path_template")
+    if not path_template:
+        return
+
+    checkpoint_path = str(path_template).format(epoch=epoch)
+    ensure_parent_dir(checkpoint_path)
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"Saved epoch {epoch} weights to {checkpoint_path}")
 
 
 def get_pad_size_divisor(config: dict) -> int:
@@ -102,6 +134,9 @@ def build_train_detection_transform(config: dict) -> DetectionTransform:
         use_gaussian_blur=bool(config.get("use_gaussian_blur", False)),
         gaussian_blur_prob=float(config.get("gaussian_blur_prob", 0.15)),
         gaussian_blur_radius=float(config.get("gaussian_blur_radius", 0.5)),
+        use_image_noise_aug=bool(config.get("use_image_noise_aug", False)),
+        image_noise_prob=float(config.get("image_noise_prob", 0.20)),
+        image_noise_std=float(config.get("image_noise_std", 0.02)),
         use_light_affine_aug=bool(config.get("use_light_affine_aug", False)),
         max_rotation_degree=float(config.get("max_rotation_degree", 5.0)),
         max_translation_ratio=float(config.get("max_translation_ratio", 0.02)),
@@ -275,8 +310,13 @@ def main():
     ):
         ensure_parent_dir(output_path)
 
+    skip_validation_during_training = bool(
+        config.get("skip_validation_during_training", False)
+    )
     train_transform = build_train_detection_transform(config)
-    val_transform = build_eval_detection_transform(config, split="val")
+    val_transform = None
+    if not skip_validation_during_training:
+        val_transform = build_eval_detection_transform(config, split="val")
 
     train_dataset = DetectionDataset(
         image_dir=config["train_image_dir"],
@@ -284,12 +324,14 @@ def main():
         split="train",
         transform=train_transform,
     )
-    val_dataset = DetectionDataset(
-        image_dir=config["val_image_dir"],
-        annotation_path=config["val_ann_path"],
-        split="val",
-        transform=val_transform,
-    )
+    val_dataset = None
+    if not skip_validation_during_training:
+        val_dataset = DetectionDataset(
+            image_dir=config["val_image_dir"],
+            annotation_path=config["val_ann_path"],
+            split="val",
+            transform=val_transform,
+        )
 
     train_batch_size = int(config.get("train_batch_size", config["batch_size"]))
     val_batch_size = int(
@@ -363,16 +405,18 @@ def main():
         persistent_workers=train_persistent_workers,
         pad_size_divisor=pad_size_divisor,
     )
-    val_loader = build_dataloader(
-        dataset=val_dataset,
-        batch_size=val_batch_size,
-        num_workers=val_num_workers,
-        shuffle=False,
-        generator=dataloader_generator,
-        pin_memory=val_pin_memory,
-        persistent_workers=val_persistent_workers,
-        pad_size_divisor=pad_size_divisor,
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = build_dataloader(
+            dataset=val_dataset,
+            batch_size=val_batch_size,
+            num_workers=val_num_workers,
+            shuffle=False,
+            generator=dataloader_generator,
+            pin_memory=val_pin_memory,
+            persistent_workers=val_persistent_workers,
+            pad_size_divisor=pad_size_divisor,
+        )
 
     model = build_model_from_config(config).to(device)
     if (
@@ -587,6 +631,7 @@ def main():
     num_epochs = int(config["num_epochs"])
     early_stopping_patience = int(config.get("early_stopping_patience", 8))
     inference_postprocess_kwargs = build_inference_postprocess_kwargs(config)
+    epoch_checkpoint_targets = parse_epoch_checkpoint_targets(config)
 
     try:
         for epoch_idx in range(start_epoch, num_epochs):
@@ -611,55 +656,74 @@ def main():
                 timing_max_steps=int(config.get("train_timing_max_steps", 100)),
             )
             eval_model = ema_model.module if ema_model is not None else model
-            val_stats = validate_one_epoch(
-                model=eval_model,
-                val_loader=val_loader,
-                criterion=criterion,
-                device=device,
-                ann_path=config["val_ann_path"],
-                use_amp=amp_enabled,
-                **inference_postprocess_kwargs,
-            )
-
             history["train_loss"].append(train_stats["loss"])
-            history["val_loss"].append(val_stats["loss"])
-            history["val_map"].append(
-                val_stats["map"] if val_stats["map"] is not None else 0.0
-            )
-            history["val_loss_raw"].append(float("nan"))
-            history["val_map_raw"].append(float("nan"))
-            history["val_loss_ema"].append(val_stats["loss"])
-            history["val_map_ema"].append(
-                val_stats["map"] if val_stats["map"] is not None else 0.0
-            )
 
-            print(
-                f"Train Loss: {train_stats['loss']:.4f} | "
-                f"Val Loss: {val_stats['loss']:.4f} | "
-                "Val mAP: "
-                f"{0.0 if val_stats['map'] is None else val_stats['map']:.4f} | "
-                "Val AP50: "
-                f"{0.0 if val_stats['map50'] is None else val_stats['map50']:.4f}"
-            )
+            if skip_validation_during_training:
+                history["val_loss"].append(float("nan"))
+                history["val_map"].append(float("nan"))
+                history["val_loss_raw"].append(float("nan"))
+                history["val_map_raw"].append(float("nan"))
+                history["val_loss_ema"].append(float("nan"))
+                history["val_map_ema"].append(float("nan"))
 
-            improved = False
-            current_map = val_stats["map"] if val_stats["map"] is not None else -1.0
-            if current_map > best_map:
-                best_map = current_map
-                torch.save(eval_model.state_dict(), config["best_model_path"])
-                print(f"Best mAP model saved ({best_map:.4f})")
-                improved = True
-
-            if val_stats["loss"] < best_val_loss:
-                best_val_loss = val_stats["loss"]
-                torch.save(eval_model.state_dict(), config["best_loss_model_path"])
-                print(f"Best loss model saved ({best_val_loss:.4f})")
-
-            if improved:
-                epochs_no_improve = 0
+                print(
+                    f"Train Loss: {train_stats['loss']:.4f} | "
+                    "Validation skipped for train+val final retrain"
+                )
             else:
-                epochs_no_improve += 1
-                print(f"No improvement! {epochs_no_improve}/{early_stopping_patience}")
+                val_stats = validate_one_epoch(
+                    model=eval_model,
+                    val_loader=val_loader,
+                    criterion=criterion,
+                    device=device,
+                    ann_path=config["val_ann_path"],
+                    use_amp=amp_enabled,
+                    **inference_postprocess_kwargs,
+                )
+
+                history["val_loss"].append(val_stats["loss"])
+                history["val_map"].append(
+                    val_stats["map"] if val_stats["map"] is not None else 0.0
+                )
+                history["val_loss_raw"].append(float("nan"))
+                history["val_map_raw"].append(float("nan"))
+                history["val_loss_ema"].append(val_stats["loss"])
+                history["val_map_ema"].append(
+                    val_stats["map"] if val_stats["map"] is not None else 0.0
+                )
+
+                print(
+                    f"Train Loss: {train_stats['loss']:.4f} | "
+                    f"Val Loss: {val_stats['loss']:.4f} | "
+                    "Val mAP: "
+                    f"{0.0 if val_stats['map'] is None else val_stats['map']:.4f} | "
+                    "Val AP50: "
+                    f"{0.0 if val_stats['map50'] is None else val_stats['map50']:.4f}"
+                )
+
+                improved = False
+                current_map = (
+                    val_stats["map"] if val_stats["map"] is not None else -1.0
+                )
+                if current_map > best_map:
+                    best_map = current_map
+                    torch.save(eval_model.state_dict(), config["best_model_path"])
+                    print(f"Best mAP model saved ({best_map:.4f})")
+                    improved = True
+
+                if val_stats["loss"] < best_val_loss:
+                    best_val_loss = val_stats["loss"]
+                    torch.save(eval_model.state_dict(), config["best_loss_model_path"])
+                    print(f"Best loss model saved ({best_val_loss:.4f})")
+
+                if improved:
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    print(
+                        f"No improvement! "
+                        f"{epochs_no_improve}/{early_stopping_patience}"
+                    )
 
             save_checkpoint(
                 checkpoint_path=config["checkpoint_path"],
@@ -673,8 +737,17 @@ def main():
                 history=history,
                 epochs_no_improve=epochs_no_improve,
             )
+            save_epoch_checkpoint_if_requested(
+                epoch=epoch,
+                model=eval_model,
+                config=config,
+                epoch_checkpoint_targets=epoch_checkpoint_targets,
+            )
 
-            if epochs_no_improve >= early_stopping_patience:
+            if (
+                not skip_validation_during_training
+                and epochs_no_improve >= early_stopping_patience
+            ):
                 print("Early stopping triggered.")
                 break
     except KeyboardInterrupt:
@@ -682,7 +755,12 @@ def main():
     finally:
         elapsed_minutes = (time.time() - training_start_time) / 60.0
         print(f"Training finished in {elapsed_minutes:.2f} minutes")
-        if history["train_loss"] or history["val_loss"] or history["val_map"]:
+        if skip_validation_during_training:
+            print(
+                "Validation was skipped during training. "
+                "Skipping training curve export."
+            )
+        elif history["train_loss"] or history["val_loss"] or history["val_map"]:
             plot_training_curves(
                 train_loss=history["train_loss"],
                 val_loss=history["val_loss"],

@@ -1557,6 +1557,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--iou_match_threshold", type=float, default=0.5)
     parser.add_argument("--score_threshold", type=float, default=None)
+    parser.add_argument("--class_score_thresholds", type=str, default=None)
     parser.add_argument("--topk_per_image", type=int, default=None)
     parser.add_argument("--postprocess_topk_stage", type=str, default=None)
     parser.add_argument("--use_nms", type=str, default=None)
@@ -1619,6 +1620,10 @@ def main():
     prediction_json_path = args.prediction_json
     if args.score_threshold is not None:
         inference_postprocess_kwargs["score_threshold"] = float(args.score_threshold)
+    if args.class_score_thresholds is not None:
+        inference_postprocess_kwargs["class_score_thresholds"] = json.loads(
+            args.class_score_thresholds
+        )
     if args.topk_per_image is not None:
         inference_postprocess_kwargs["topk_per_image"] = int(args.topk_per_image)
     if args.postprocess_topk_stage is not None:
@@ -1716,7 +1721,7 @@ def main():
             pad_size_divisor=int(
                 config.get(
                     "pad_size_divisor",
-                    32 if str(config.get("model_backend", "")).lower() in {"hf_rtdetr_v2", "hf_rtdetr_v2_aux", "hf_rtdetr_v2_qs"} else 1,
+                    32 if str(config.get("model_backend", "")).lower() in {"hf_rtdetr_v2", "hf_rtdetr_v2_aux"} else 1,
                 )
             ),
         ),

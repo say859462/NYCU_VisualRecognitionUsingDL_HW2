@@ -26,7 +26,6 @@ def _is_hf_rtdetr_backend(model_backend: str | None) -> bool:
     return str(model_backend or "").lower() in {
         "hf_rtdetr_v2",
         "hf_rtdetr_v2_aux",
-        "hf_rtdetr_v2_qs",
     }
 
 
@@ -169,6 +168,7 @@ def build_inference_postprocess_kwargs(config: dict) -> dict:
             config.get("rtdetr_postprocess_variant", "official_hf")
         ).lower(),
         "score_threshold": float(config.get("score_threshold", 0.20)),
+        "class_score_thresholds": config.get("class_score_thresholds"),
         "topk_per_image": int(config.get("topk_per_image", 10)),
         "postprocess_topk_stage": str(
             config.get("postprocess_topk_stage", "pre_class_nms")
@@ -202,6 +202,65 @@ def build_inference_postprocess_kwargs(config: dict) -> dict:
             config.get("cross_class_overlap_score_margin", 0.08)
         ),
     }
+
+
+def _resolve_postprocess_threshold(
+    score_threshold: float,
+    class_score_thresholds: dict | list | tuple | None,
+) -> float:
+    """Use the most permissive threshold needed before class-specific filtering."""
+    min_threshold = float(score_threshold)
+    if class_score_thresholds is None:
+        return min_threshold
+
+    if isinstance(class_score_thresholds, dict):
+        candidates = class_score_thresholds.values()
+    else:
+        candidates = class_score_thresholds
+
+    for candidate in candidates:
+        try:
+            min_threshold = min(min_threshold, float(candidate))
+        except (TypeError, ValueError):
+            continue
+    return float(min_threshold)
+
+
+def _build_label_thresholds(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    score_threshold: float,
+    class_score_thresholds: dict | list | tuple | None,
+) -> torch.Tensor:
+    """Build per-prediction thresholds from a global base and optional class overrides."""
+    thresholds = torch.full_like(scores, float(score_threshold))
+    if class_score_thresholds is None or scores.numel() == 0:
+        return thresholds
+
+    if isinstance(class_score_thresholds, dict):
+        for class_idx, threshold in class_score_thresholds.items():
+            try:
+                label_idx = int(class_idx)
+                threshold_value = float(threshold)
+            except (TypeError, ValueError):
+                continue
+            class_mask = labels == label_idx
+            if class_mask.any():
+                thresholds[class_mask] = threshold_value
+        return thresholds
+
+    threshold_tensor = torch.as_tensor(
+        class_score_thresholds,
+        dtype=scores.dtype,
+        device=scores.device,
+    ).flatten()
+    if threshold_tensor.numel() == 0:
+        return thresholds
+
+    valid_mask = (labels >= 0) & (labels < threshold_tensor.numel())
+    if valid_mask.any():
+        thresholds[valid_mask] = threshold_tensor[labels[valid_mask]]
+    return thresholds
 
 
 def _to_loss_tensor(value, device: torch.device) -> torch.Tensor:
@@ -517,6 +576,7 @@ def merge_coco_prediction_sets(
     prediction_sets: list[list[dict]],
     image_sizes_by_id: dict[int, list[float] | tuple[float, float]],
     score_threshold: float = 0.20,
+    class_score_thresholds: dict | list | tuple | None = None,
     topk_per_image: int = 10,
     postprocess_topk_stage: str = "final",
     class_logit_bias: dict | list | tuple | None = None,
@@ -567,7 +627,13 @@ def merge_coco_prediction_sets(
             if scores.numel() == 0:
                 continue
 
-            keep = scores >= float(score_threshold)
+            thresholds = _build_label_thresholds(
+                scores=scores,
+                labels=labels,
+                score_threshold=score_threshold,
+                class_score_thresholds=class_score_thresholds,
+            )
+            keep = scores >= thresholds
             scores = scores[keep]
             labels = labels[keep]
             boxes = boxes[keep]
@@ -589,6 +655,20 @@ def merge_coco_prediction_sets(
                     boxes = boxes[kept_indices]
                     scores, labels, boxes = _sort_predictions_by_score(scores, labels, boxes)
 
+        if scores.numel() == 0:
+            continue
+
+        thresholds = _build_label_thresholds(
+            scores=scores,
+            labels=labels,
+            score_threshold=score_threshold,
+            class_score_thresholds=class_score_thresholds,
+        )
+        keep = scores >= thresholds
+        scores = scores[keep]
+        labels = labels[keep]
+        boxes = boxes[keep]
+        scores, labels, boxes = _sort_predictions_by_score(scores, labels, boxes)
         if scores.numel() == 0:
             continue
 
@@ -776,6 +856,7 @@ def _postprocess_single_image(
     pred_boxes: torch.Tensor,
     target: dict,
     score_threshold: float,
+    class_score_thresholds: dict | list | tuple | None,
     topk_per_image: int,
     postprocess_topk_stage: str,
     class_logit_bias: dict | list | tuple | None,
@@ -806,7 +887,12 @@ def _postprocess_single_image(
         pred_quality_scores=pred_quality_scores,
         class_logit_bias=class_logit_bias,
     )
-    thresholds = torch.full_like(scores, score_threshold)
+    thresholds = _build_label_thresholds(
+        scores=scores,
+        labels=labels,
+        score_threshold=score_threshold,
+        class_score_thresholds=class_score_thresholds,
+    )
     if postprocess_topk_stage not in {"pre_class_nms", "post_class_nms", "final"}:
         postprocess_topk_stage = "pre_class_nms"
 
@@ -814,6 +900,9 @@ def _postprocess_single_image(
         "_meta": {
             "topk_stage": postprocess_topk_stage,
             "class_logit_bias": class_logit_bias if class_logit_bias else {},
+            "class_score_thresholds": (
+                class_score_thresholds if class_score_thresholds else {}
+            ),
         },
     }
     _record_stage(stage_debug, "pre_threshold", image_id, image_size, scores, labels, boxes)
@@ -931,6 +1020,7 @@ def _postprocess_single_image_rtdetr_official(
     pred_boxes: torch.Tensor,
     target: dict,
     score_threshold: float,
+    class_score_thresholds: dict | list | tuple | None,
 ):
     image_id = int(target["image_id"].item())
     output_size = target.get("orig_size", target["size"]).float()
@@ -943,7 +1033,10 @@ def _postprocess_single_image_rtdetr_official(
                 logits=raw_logits.unsqueeze(0).float(),
                 pred_boxes=pred_boxes.unsqueeze(0).float(),
             ),
-            threshold=float(score_threshold),
+            threshold=_resolve_postprocess_threshold(
+                score_threshold,
+                class_score_thresholds,
+            ),
             target_sizes=output_size.unsqueeze(0),
             use_focal_loss=True,
         )[0]
@@ -961,16 +1054,35 @@ def _postprocess_single_image_rtdetr_official(
         labels = index % num_classes
         query_index = index // num_classes
         boxes = boxes[query_index]
-        keep = scores > float(score_threshold)
+        thresholds = _build_label_thresholds(
+            scores=scores,
+            labels=labels,
+            score_threshold=score_threshold,
+            class_score_thresholds=class_score_thresholds,
+        )
+        keep = scores >= thresholds
         scores = scores[keep]
         labels = labels[keep]
         boxes = boxes[keep]
 
+    thresholds = _build_label_thresholds(
+        scores=scores,
+        labels=labels,
+        score_threshold=score_threshold,
+        class_score_thresholds=class_score_thresholds,
+    )
+    keep = scores >= thresholds
+    scores = scores[keep]
+    labels = labels[keep]
+    boxes = boxes[keep]
     scores, labels, boxes = _sort_predictions_by_score(scores, labels, boxes)
 
     stage_debug = {
         "_meta": {
             "score_threshold": float(score_threshold),
+            "class_score_thresholds": (
+                class_score_thresholds if class_score_thresholds else {}
+            ),
             "source": "transformers.RTDetrImageProcessor.post_process_object_detection"
             if processor is not None
             else "fallback_clone_of_transformers_rt_detr_postprocess",
@@ -990,6 +1102,7 @@ def _postprocess_single_image_rtdetr_official_local_clone(
     pred_boxes: torch.Tensor,
     target: dict,
     score_threshold: float,
+    class_score_thresholds: dict | list | tuple | None,
 ):
     image_id = int(target["image_id"].item())
     output_size = target.get("orig_size", target["size"]).float()
@@ -1005,7 +1118,13 @@ def _postprocess_single_image_rtdetr_official_local_clone(
     labels = index % num_classes
     query_index = index // num_classes
     boxes = boxes[query_index]
-    keep = scores > float(score_threshold)
+    thresholds = _build_label_thresholds(
+        scores=scores,
+        labels=labels,
+        score_threshold=score_threshold,
+        class_score_thresholds=class_score_thresholds,
+    )
+    keep = scores >= thresholds
     scores = scores[keep]
     labels = labels[keep]
     boxes = boxes[keep]
@@ -1014,6 +1133,9 @@ def _postprocess_single_image_rtdetr_official_local_clone(
     stage_debug = {
         "_meta": {
             "score_threshold": float(score_threshold),
+            "class_score_thresholds": (
+                class_score_thresholds if class_score_thresholds else {}
+            ),
             "source": "official_local_clone",
             "topk_stage": "official",
         }
@@ -1032,6 +1154,7 @@ def collect_coco_predictions(
     use_official_backend_postprocess=False,
     rtdetr_postprocess_variant="official_hf",
     score_threshold=0.20,
+    class_score_thresholds=None,
     topk_per_image=10,
     postprocess_topk_stage="pre_class_nms",
     class_logit_bias=None,
@@ -1074,6 +1197,7 @@ def collect_coco_predictions(
                     pred_boxes=pred_boxes[batch_idx],
                     target=targets[batch_idx],
                     score_threshold=score_threshold,
+                    class_score_thresholds=class_score_thresholds,
                 )
             else:
                 postprocess = _postprocess_single_image_rtdetr_official(
@@ -1081,6 +1205,7 @@ def collect_coco_predictions(
                     pred_boxes=pred_boxes[batch_idx],
                     target=targets[batch_idx],
                     score_threshold=score_threshold,
+                    class_score_thresholds=class_score_thresholds,
                 )
         else:
             postprocess = _postprocess_single_image(
@@ -1090,6 +1215,7 @@ def collect_coco_predictions(
                 pred_boxes=pred_boxes[batch_idx],
                 target=targets[batch_idx],
                 score_threshold=score_threshold,
+                class_score_thresholds=class_score_thresholds,
                 topk_per_image=topk_per_image,
                 postprocess_topk_stage=postprocess_topk_stage,
                 class_logit_bias=class_logit_bias,
@@ -1117,6 +1243,7 @@ def collect_coco_predictions_debug(
     use_official_backend_postprocess=False,
     rtdetr_postprocess_variant="official_hf",
     score_threshold=0.20,
+    class_score_thresholds=None,
     topk_per_image=10,
     postprocess_topk_stage="pre_class_nms",
     class_logit_bias=None,
@@ -1156,6 +1283,7 @@ def collect_coco_predictions_debug(
                     pred_boxes=pred_boxes[batch_idx],
                     target=targets[batch_idx],
                     score_threshold=score_threshold,
+                    class_score_thresholds=class_score_thresholds,
                 )
             else:
                 postprocess = _postprocess_single_image_rtdetr_official(
@@ -1163,6 +1291,7 @@ def collect_coco_predictions_debug(
                     pred_boxes=pred_boxes[batch_idx],
                     target=targets[batch_idx],
                     score_threshold=score_threshold,
+                    class_score_thresholds=class_score_thresholds,
                 )
         else:
             postprocess = _postprocess_single_image(
@@ -1172,6 +1301,7 @@ def collect_coco_predictions_debug(
                 pred_boxes=pred_boxes[batch_idx],
                 target=targets[batch_idx],
                 score_threshold=score_threshold,
+                class_score_thresholds=class_score_thresholds,
                 topk_per_image=topk_per_image,
                 postprocess_topk_stage=postprocess_topk_stage,
                 class_logit_bias=class_logit_bias,

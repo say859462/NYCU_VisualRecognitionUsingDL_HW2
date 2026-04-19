@@ -20,7 +20,7 @@ from utils import (
     parse_tta_scales,
 )
 
-HF_RTDETR_BACKENDS = {"hf_rtdetr_v2", "hf_rtdetr_v2_aux", "hf_rtdetr_v2_qs"}
+HF_RTDETR_BACKENDS = {"hf_rtdetr_v2", "hf_rtdetr_v2_aux"}
 
 
 def get_pad_size_divisor(config: dict) -> int:
@@ -96,6 +96,7 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--topk_per_image", type=int, default=None)
     parser.add_argument("--postprocess_topk_stage", type=str, default=None)
     parser.add_argument("--score_threshold", type=float, default=None)
+    parser.add_argument("--class_score_thresholds", type=str, default=None)
     parser.add_argument("--use_nms", type=str, default=None)
     parser.add_argument("--nms_iou_threshold", type=float, default=None)
     parser.add_argument(
@@ -222,6 +223,10 @@ def apply_postprocess_overrides(
     """Apply CLI overrides to the postprocess settings."""
     if args.score_threshold is not None:
         inference_kwargs["score_threshold"] = float(args.score_threshold)
+    if args.class_score_thresholds is not None:
+        inference_kwargs["class_score_thresholds"] = parse_optional_json(
+            args.class_score_thresholds
+        )
     if args.topk_per_image is not None:
         inference_kwargs["topk_per_image"] = int(args.topk_per_image)
     if args.postprocess_topk_stage is not None:

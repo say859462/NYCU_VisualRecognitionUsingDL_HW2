@@ -110,6 +110,9 @@ class DetectionTransform:
         use_gaussian_blur: bool = False,
         gaussian_blur_prob: float = 0.15,
         gaussian_blur_radius: float = 0.5,
+        use_image_noise_aug: bool = False,
+        image_noise_prob: float = 0.20,
+        image_noise_std: float = 0.02,
         use_light_affine_aug: bool = False,
         max_rotation_degree: float = 5.0,
         max_translation_ratio: float = 0.02,
@@ -161,6 +164,9 @@ class DetectionTransform:
         self.use_gaussian_blur = use_gaussian_blur
         self.gaussian_blur_prob = max(0.0, float(gaussian_blur_prob))
         self.gaussian_blur_radius = max(0.0, float(gaussian_blur_radius))
+        self.use_image_noise_aug = bool(use_image_noise_aug)
+        self.image_noise_prob = max(0.0, float(image_noise_prob))
+        self.image_noise_std = max(0.0, float(image_noise_std))
         self.use_light_affine_aug = use_light_affine_aug
         self.max_rotation_degree = max_rotation_degree
         self.max_translation_ratio = max_translation_ratio
@@ -710,6 +716,15 @@ class DetectionTransform:
                 image = image.filter(ImageFilter.GaussianBlur(radius=self.gaussian_blur_radius))
 
         image_tensor = TF.to_tensor(image)
+        if (
+            self.split == "train"
+            and self.use_image_noise_aug
+            and self.image_noise_std > 0.0
+            and torch.rand(1).item() < self.image_noise_prob
+        ):
+            noise = torch.randn_like(image_tensor) * self.image_noise_std
+            image_tensor = (image_tensor + noise).clamp(0.0, 1.0)
+
         image_tensor = TF.normalize(
             image_tensor,
             mean=[0.485, 0.456, 0.406],
