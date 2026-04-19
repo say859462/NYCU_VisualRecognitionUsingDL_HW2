@@ -165,27 +165,6 @@ python visualize.py --config .\config.json --split val --model_path .\Model_Weig
 | `EXP68b` | `EXP60 + EXP64` concat + NMS ensemble | `0.4768` | `0.9359` | `0.416` | - | ensemble regressed |
 
 
-## Analysis Workflow
-
-This project relies heavily on validation visualization and structured error summaries.
-
-Important analysis artifacts include:
-
-- training curves
-- confusion matrices
-- query coverage curves
-- per-digit error breakdowns
-- representative qualitative samples
-
-Examples:
-
-- [Plot/54/val_visualization](/E:/School/Course/VisualRecognitionUsingDL/HW2/Plot/54/val_visualization)
-- [Plot/60/val_visualization_gated020](/E:/School/Course/VisualRecognitionUsingDL/HW2/Plot/60/val_visualization_gated020)
-- [Plot/64/val_visualization_attn015](/E:/School/Course/VisualRecognitionUsingDL/HW2/Plot/64/val_visualization_attn015)
-- [Plot/65/val_visualization](/E:/School/Course/VisualRecognitionUsingDL/HW2/Plot/65/val_visualization)
-
-The final report also uses these outputs to justify every important conclusion with evidence instead of only qualitative claims.
-
 ---
 
 ## References
