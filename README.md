@@ -174,6 +174,6 @@ python visualize.py --config .\config.json --split val --model_path .\Model_Weig
 - DETR: End-to-End Object Detection with Transformers
 - RT-DETRv2: Improved Baseline for Real-Time Detection Transformer
 ## Snapshot
-<img width="1209" height="71" alt="image" src="https://github.com/user-attachments/assets/119ced78-2577-4e59-b821-65a7510057c3" />
+<img width="1273" height="76" alt="image" src="https://github.com/user-attachments/assets/cbe03c94-ecb9-4e97-9035-74cc40f2e7d7" />
 
 
