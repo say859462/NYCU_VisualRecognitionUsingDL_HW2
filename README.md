@@ -49,7 +49,7 @@ In short, **auxiliary fusion was the most reliable positive direction**, while h
 
 ### Final Mainline Detector
 
-- Backbone: `ResNet-50-VD`
+- Backbone: `ResNet-50`
 - Detector: `RT-DETRv2`
 - Model source: `PekingU/rtdetr_v2_r50vd`
 - Load strategy: `pretrained_reset_transformer`
@@ -116,69 +116,33 @@ pip install torch torchvision transformers scipy pillow matplotlib tqdm pycocoto
 
 ---
 
-## Project Layout
-
-```text
-HW2/
-├── Dataset/                                # train / valid / test images and COCO jsons
-├── Files/                                  # reports and experiment logs
-├── Model_Weight/                           # checkpoints
-├── Plot/                                   # training curves and validation analysis
-├── Prediction/                             # prediction json outputs
-├── AGENT.md                                # condensed experiment conclusions
-├── main.py                                 # training entry
-├── test.py                                 # inference / validation entry
-├── visualize.py                            # validation analysis / visualization
-├── dataset.py                              # dataset and augmentation pipeline
-├── model.py                                # detector implementations and adapters
-├── utils.py                                # postprocess, evaluation, saving helpers
-├── train.py                                # one-epoch training loop
-├── val.py                                  # validation loop
-└── config_exp*.json                        # experiment configs
-```
-
----
 
 ## Usage
 
-### 1. Train a Baseline or New Experiment
-
-Example: train the strong RT-DETRv2 baseline (`EXP54`)
+### 1. Train 
 
 ```powershell
-python main.py --config .\config_exp54_rtdetrv2_full_reset_auxaug.json
+python main.py --config .\config.json
 ```
 
-Example: train the auxiliary-branch model (`EXP56`)
-
-```powershell
-python main.py --config .\config_exp56_rtdetrv2_full_reset_auxcls_trainonly.json
-```
-
-Example: train layout-shift augmentation experiment (`EXP69a`)
-
-```powershell
-python main.py --config .\config_exp69a_rtdetrv2_auxcls_layout_shift_train.json
-```
 
 ### 2. Validation / Inference
 
-Evaluate `EXP60`:
+Evaluate :
 
 ```powershell
-python test.py --config .\config_exp60_rtdetrv2_auxcls_gated_fusion_eval.json --split val --model_path .\Model_Weight\56\best_model_rtdetrv2_full_reset_auxcls_trainonly.pth --output_json .\Prediction\exp60_val_gated020.json
+python test.py --config .\config.json --split val --model_path .\Model_Weight\best_model.pth --output_json .\Prediction\val.json
 ```
-
-Evaluate `EXP64` with attenuation `0.15`:
+Evaluate with attenuation `0.15`:
 
 ```powershell
-python test.py --config .\config_exp64_rtdetrv2_auxcls_family_attenuation_eval.json --split val --model_path .\Model_Weight\56\best_model_rtdetrv2_full_reset_auxcls_trainonly.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_json .\Prediction\exp64_val_attn015.json
+python test.py --config .\config.json --split val --model_path .\Model_Weight\best_model.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_json .\Prediction\val_attn015.json
 ```
 
 Generate test predictions:
 
 ```powershell
-python test.py --config .\config_exp64_rtdetrv2_auxcls_family_attenuation_eval.json --split test --model_path .\Model_Weight\56\best_model_rtdetrv2_full_reset_auxcls_trainonly.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_json .\Prediction\pred.json
+python test.py --config .\config.json --split test --model_path .\Model_Weight\best_model.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_json .\Prediction\pred.json
 ```
 
 ### 3. Visualization / Error Analysis
@@ -186,15 +150,7 @@ python test.py --config .\config_exp64_rtdetrv2_auxcls_family_attenuation_eval.j
 Run detailed validation analysis for `EXP64 attn015`:
 
 ```powershell
-python visualize.py --config .\config_exp64_rtdetrv2_auxcls_family_attenuation_eval.json --split val --model_path .\Model_Weight\56\best_model_rtdetrv2_full_reset_auxcls_trainonly.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_dir .\Plot\64\val_visualization_attn015
-```
-
-### 4. Preview Train-Time Augmentations
-
-For `EXP69a`, preview horizontal layout-shift augmentation before training:
-
-```powershell
-python .\preview_train_augmentations.py --config .\config_exp69a_rtdetrv2_auxcls_layout_shift_train.json --output_dir .\Plot\69a\train_aug_preview --num_samples 8
+python visualize.py --config .\config.json --split val --model_path .\Model_Weight\best_model.pth --aux_digit_family_attenuation_weights '{"1,4,7": 0.15}' --output_dir .\Plot\val_visualization
 ```
 
 ---
@@ -214,17 +170,6 @@ python .\preview_train_augmentations.py --config .\config_exp69a_rtdetrv2_auxcls
 | `EXP68` | `EXP60 + EXP64` WBF ensemble | `0.4767` | `0.9355` | `0.416` | - | ensemble regressed |
 | `EXP68b` | `EXP60 + EXP64` concat + NMS ensemble | `0.4768` | `0.9359` | `0.416` | - | ensemble regressed |
 
-### Final Recommendation
-
-If the goal is the **best validation peak**, use:
-
-- `EXP60`
-
-If the goal is a **more robust submission-oriented variant** with the same hidden-test score in our experiments, use:
-
-- `EXP64 attn015`
-
----
 
 ## Analysis Workflow
 
@@ -249,19 +194,13 @@ The final report also uses these outputs to justify every important conclusion w
 
 ---
 
-## Submission Notes
-
-- Final competition submission must be a COCO-style `pred.json`
-- Do **not** include dataset files or model checkpoints in the final zip
-- The report must be written in **English**
-- The final report format required by the homework is **PDF**
-
----
-
 ## References
 
 - RT-DETR official repository: https://github.com/lyuwenyu/RT-DETR
 - Hugging Face checkpoint: `PekingU/rtdetr_v2_r50vd`
 - DETR: End-to-End Object Detection with Transformers
 - RT-DETRv2: Improved Baseline for Real-Time Detection Transformer
+## Snapshot
+<img width="1209" height="71" alt="image" src="https://github.com/user-attachments/assets/119ced78-2577-4e59-b821-65a7510057c3" />
+
 
