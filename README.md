@@ -1,6 +1,4 @@
-# HW2 — DETR-Based Street-View Digit Detection
-
-#### ***Course:*** Visual Recognition using Deep Learning (NYCU)
+# NYCU Visual Recognition using Deep Learning
 
 #### ***Student:*** 劉哲良
 
